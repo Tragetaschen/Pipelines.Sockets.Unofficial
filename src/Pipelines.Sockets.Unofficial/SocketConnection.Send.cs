@@ -127,6 +127,7 @@ namespace Pipelines.Sockets.Unofficial
                 try { _sendToSocket.Writer.Complete(error); } catch { }
                 try { _sendToSocket.Reader.Complete(error); } catch { }
                 TrySetShutdown(error, this, PipeShutdownKind.OutputReaderCompleted);
+                _readerCompletedTcs.TrySetResult(0);
 
                 var args = _writerArgs;
                 _writerArgs = null;

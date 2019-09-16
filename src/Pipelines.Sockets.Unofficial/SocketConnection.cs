@@ -217,6 +217,7 @@ namespace Pipelines.Sockets.Unofficial
         /// Connection for sending data
         /// </summary>
         public PipeWriter Output => _output;
+        public Task ReaderCompleted => _readerCompletedTcs.Task;
         private string Name { get; }
 
         /// <summary>
@@ -320,6 +321,7 @@ namespace Pipelines.Sockets.Unofficial
         private readonly Pipe _sendToSocket, _receiveFromSocket;
         private readonly PipeReader _input; // was _receiveFromSocket.Reader;
         private readonly PipeWriter _output; // was _sendToSocket.Writer;
+        private readonly TaskCompletionSource<int> _readerCompletedTcs;
 
         // TODO: flagify and fully implement
 #pragma warning disable CS0414, CS0649, IDE0044, IDE0051, IDE0052
@@ -360,6 +362,7 @@ namespace Pipelines.Sockets.Unofficial
             _receiveFromSocket = new Pipe(receivePipeOptions);
             _receiveOptions = receivePipeOptions;
             _sendOptions = sendPipeOptions;
+            _readerCompletedTcs = new TaskCompletionSource<int>();
 
             _input = new WrappedReader(_receiveFromSocket.Reader, this);
             _output = new WrappedWriter(_sendToSocket.Writer, this);
