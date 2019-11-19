@@ -31,38 +31,34 @@ namespace Pipelines.Sockets.Unofficial.Tests
         [Fact]
         public void CanPartialFlush()
         {
-            using (var bw = BufferWriter<byte>.Create(blockSize: 16))
-            {
-                bw.GetSequence(128);
-                bw.Advance(50);
-                bw.Advance(30);
+            using var bw = BufferWriter<byte>.Create(blockSize: 16);
+            bw.GetSequence(128);
+            bw.Advance(50);
+            bw.Advance(30);
 
-                Assert.Equal(80, bw.Length);
+            Assert.Equal(80, bw.Length);
 
-                using (var x1 = bw.Flush(20))
-                {
-                    Assert.Equal(20, x1.Value.Length);
-                    Assert.Equal(60, bw.Length);
-                    using (var x2 = bw.Flush())
-                    {
-                        Assert.Equal(60, x2.Value.Length);
-                        Assert.Equal(0, bw.Length);
-                    }
-                }
-            }
+            using var x1 = bw.Flush(20);
+            Assert.Equal(20, x1.Value.Length);
+            Assert.Equal(60, bw.Length);
+            using var x2 = bw.Flush();
+            Assert.Equal(60, x2.Value.Length);
+            Assert.Equal(0, bw.Length);
         }
 
         [Fact]
         public void BufferWriterDoesNotLeak()
         {
-            using(var bw = BufferWriter<byte>.Create(blockSize: 16))
+#pragma warning disable IDE0063 // this would break the "all dead now" test
+            using (var bw = BufferWriter<byte>.Create(blockSize: 16))
+#pragma warning restore IDE0063
             {
                 var writer = bw.Writer;
 
                 byte nextVal = 0;
                 Owned<ReadOnlySequence<byte>> Write(int count)
                 {
-                    for(int i = 0; i < count; i++)
+                    for (int i = 0; i < count; i++)
                     {
                         var span = writer.GetSpan(5);
                         span.Fill(nextVal++);
@@ -101,12 +97,7 @@ namespace Pipelines.Sockets.Unofficial.Tests
                 for (int i = 0; i < chunks.Length; i++) Log?.WriteLine($"chunk {i}: {GetState(chunks[i])}");
                 for (int i = 0; i < chunks.Length; i++) chunks[i].Dispose();
                 for (int i = 0; i < chunks.Length; i++) Log?.WriteLine($"chunk {i}: {GetState(chunks[i])}");
-#if DEBUG
-                // should have the last buffer remaining
-                Assert.Equal(1, BufferWriter<byte>.LiveSegmentCount);
-#endif
             }
-
 #if DEBUG
             // all dead now
             Assert.Equal(0, BufferWriter<byte>.LiveSegmentCount);
@@ -136,36 +127,34 @@ namespace Pipelines.Sockets.Unofficial.Tests
         [Fact]
         public void CanAllocateSequences()
         {
-            using (var bw = BufferWriter<byte>.Create(blockSize: 16))
+            using var bw = BufferWriter<byte>.Create(blockSize: 16);
+            Log?.WriteLine(bw.GetState());
+            Assert.Equal(0, bw.Length);
+
+            var seq = bw.GetSequence(70);
+            Assert.Equal(80, seq.Length);
+            Log?.WriteLine(bw.GetState());
+            Assert.Equal(0, bw.Length);
+
+            bw.Advance(40);
+            Log?.WriteLine(bw.GetState());
+            Assert.Equal(40, bw.Length);
+
+            for (int i = 1; i <= 5; i++)
             {
-                Log?.WriteLine(bw.GetState());
-                Assert.Equal(0, bw.Length);
-
-                var seq = bw.GetSequence(70);
-                Assert.Equal(80, seq.Length);
-                Log?.WriteLine(bw.GetState());
-                Assert.Equal(0, bw.Length);
-
-                bw.Advance(40);
-                Log?.WriteLine(bw.GetState());
-                Assert.Equal(40, bw.Length);
-
-                for (int i = 1; i <= 5; i++)
-                {
-                    Log?.WriteLine($"Leasing span {i}... {bw.GetState()}");
-                    bw.GetSpan(8);
-                    bw.Advance(5);
-                    Assert.Equal(40 + (5 * i), bw.Length);
-                }
-                Log?.WriteLine(bw.GetState());
-
-                Assert.Equal(65, bw.Length);
-                using (var ros = bw.Flush())
-                {
-                    Assert.Equal(65, ros.Value.Length);
-                }
-                Assert.Equal(0, bw.Length);
+                Log?.WriteLine($"Leasing span {i}... {bw.GetState()}");
+                bw.GetSpan(8);
+                bw.Advance(5);
+                Assert.Equal(40 + (5 * i), bw.Length);
             }
+            Log?.WriteLine(bw.GetState());
+
+            Assert.Equal(65, bw.Length);
+            using (var ros = bw.Flush())
+            {
+                Assert.Equal(65, ros.Value.Length);
+            }
+            Assert.Equal(0, bw.Length);
         }
     }
 }
