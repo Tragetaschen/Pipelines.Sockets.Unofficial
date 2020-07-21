@@ -1,5 +1,27 @@
 # Release Notes
 
+## 2.1.16
+
+- improve detection of assembly binding errors
+
+## 2.1.14
+
+- fix possible race conditions in `MutexSlim` (remove "uncontested" concept)
+
+## 2.1.11
+
+- `MutexSlim` - make it "fair" ([context](https://github.com/StackExchange/StackExchange.Redis/issues/1440))
+
+## 2.1.8
+
+- fix deterministic builds (all green shields)
+- update dependency chain
+- runtime check for additional libraries (assembly binding, etc) 
+
+## 2.1.1
+
+- library updates
+
 ## 2.1.0
 
 - dependency updates

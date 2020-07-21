@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -142,16 +143,32 @@ namespace Pipelines.Sockets.Unofficial
         {
             static string ComputeAssemblyFailureMessage()
             {
-                bool havePipe = false, haveBuffers = false;
-                try { CheckPipe(); havePipe = true; } catch { }
-                try { CheckBuffers(); haveBuffers = true; } catch { }
+                List<string> failures = null;
+                void AddFailure(string assembly)
+                {
+                    if (failures == null) failures = new List<string>();
+                    failures.Add(assembly);
+                }
+                try { CheckPipe(); } catch { AddFailure("System.IO.Pipelines"); }
+                try { CheckBuffers(); } catch { AddFailure("System.Buffers"); }
+                try { CheckUnsafe(); } catch { AddFailure("System.Runtime.CompilerServices.Unsafe"); }
+                try { CheckNumerics(); } catch { AddFailure("System.Numerics.Vectors"); }
 
-                if (havePipe && haveBuffers) return "";
+                try
+                {
+                    ExecutePipe(out var assembly);
+                    if (assembly is object) AddFailure(assembly);
+                }
+                catch(Exception ex)
+                {   // ExecutePipe exploded, but not in a way we expected
+                    return ex.Message;
+                }
 
-                var missing = havePipe ? "System.Buffers" : (haveBuffers ? "System.IO.Pipelines" : "System.Buffers and System.IO.Pipelines");
-                return "The assembly for " + missing + " could not be loaded; this usually means a missing assembly binding redirect - try checking this, and adding any that are missing;"
+                if (failures == null || failures.Count == 0) return "";
+
+                return "The assembly for " + string.Join(" + ", failures) + " could not be loaded; this usually means a missing assembly binding redirect - try checking this, and adding any that are missing;"
                     + " note that it is not always possible to add this redirects - for example 'azure functions v1'; it looks like you may need to use 'azure functions v2' for that - sorry, but that's out of our control";
-        }
+            }
             return s_assemblyFailureMessssage ?? (s_assemblyFailureMessssage = ComputeAssemblyFailureMessage());
         }
         internal static void AssertDependencies()
@@ -161,10 +178,49 @@ namespace Pipelines.Sockets.Unofficial
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void CheckPipe() => GC.KeepAlive(typeof(System.IO.Pipelines.Pipe));
+        private static void CheckPipe() => GC.KeepAlive(System.IO.Pipelines.PipeOptions.Default);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static void CheckBuffers() => GC.KeepAlive(typeof(System.Buffers.ArrayPool<byte>));
+        private static void CheckBuffers()
+        {
+            var arr = System.Buffers.ArrayPool<byte>.Shared.Rent(64);
+            GC.KeepAlive(arr);
+            System.Buffers.ArrayPool<byte>.Shared.Return(arr);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void CheckUnsafe() => _ = System.Runtime.CompilerServices.Unsafe.SizeOf<int>();
+
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void CheckNumerics() => _ = System.Numerics.Vector.IsHardwareAccelerated;
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static void ExecutePipe(out string assembly)
+        {   // try everything combined
+            assembly = null;
+            try
+            {
+                var pipe = new System.IO.Pipelines.Pipe();
+                pipe.Writer.GetSpan(4);
+                pipe.Writer.Advance(4);
+                pipe.Writer.Complete();
+                pipe.Reader.TryRead(out var _);
+            }
+            catch(Exception ex)
+            {   // look (non-greedy) for either 'System.Blah' or 'System.Blah,...
+                var match = Regex.Match(ex.Message, @"'(System\..*?)[,']");
+                if (match.Success)
+                {
+                    assembly = match.Groups[1].Value;
+                }
+                else
+                {
+                    throw;
+                }
+            }
+        }
+
 
 #pragma warning disable RCS1231 // Make parameter ref read-only.
         internal static ArraySegment<byte> GetArray(this Memory<byte> buffer) => GetArray((ReadOnlyMemory<byte>)buffer);

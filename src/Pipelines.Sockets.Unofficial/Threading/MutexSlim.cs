@@ -27,8 +27,7 @@ namespace Pipelines.Sockets.Unofficial.Threading
          *   (I'm looking at you, SemaphoreSlim... you know what you did)
          * - must be low allocation
          * - should allow control of the threading model for async callback
-         * - *reasonable* "fairness" is needed (we won't get fussy if there
-         *   are rare scenarios that don't guarantee absolute fairness)
+         * - fairness is desirable; see note "FAIRNESS" below
          * - timeout support is required
          *   value can be per mutex - doesn't need to be per-Wait[Async]
          * - a "using"-style API is a nice-to-have, to avoid try/finally
@@ -38,6 +37,31 @@ namespace Pipelines.Sockets.Unofficial.Threading
          * - sync path uses per-thread ([ThreadStatic])/Monitor pulse for comms
          * - async path uses custom awaitable with zero-alloc on immediate win
          */
+
+        /* Note on FAIRNESS
+
+        in particular, consider the following scenario with two
+        *incomplete* async calls from the same execution path:
+
+        // ** note not awaited yet
+        var a = obj.DoSomethingAsync("a"); // that uses MutexSlim
+        var b = obj.DoSomethingAsync("b"); // that uses MutexSlim
+
+        await a;
+        await b;
+
+        Now: which runs first? "a"? or "b"? Without fairness, it can
+        be either; consider that the lock is owned when "a" starts
+        so a continuation is queued and the execution flow of
+        DoSomethingAsync is suspended at the TryWaitAsync; now
+        imagine a rare race when the thing releasing the lock
+        happens at *exactly* the same time as our call into "b";
+        MutexSlim allows callers to interlocked-take the token,
+        so "b" can sneak in and win; so "b" runs, and activates
+        "a" *on the way out*. The fairness of MutexSlim has
+        been modified to prevent this problem.
+
+        */
 
         /* usage:
 
@@ -117,65 +141,66 @@ namespace Pipelines.Sockets.Unofficial.Threading
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void Release(int token, bool demandMatch = true)
         {
-            // release the token (we can check for wrongness without needing the lock, note)
-            Log($"attempting to release token {LockState.ToString(token)}");
-            if (Interlocked.CompareExchange(ref _token, LockState.ChangeState(token, LockState.Pending), token) != token)
+            // validate the token
+            if (Volatile.Read(ref _token) != token)
             {
                 Log($"token {LockState.ToString(token)} is invalid");
                 if (demandMatch) Throw.InvalidLockHolder();
                 return;
             }
 
-            ActivateNextQueueItem();
+            ActivateNextQueueItemWithValidatedToken(token);
         }
 
-        private void ActivateNextQueueItem()
+        private void ActivateNextQueueItemWithValidatedToken(int token)
         {
             // see if we can nudge the next waiter
             lock (_queue)
             {
-                if (_queue.Count == 0)
+                if (Volatile.Read(ref _token) != token)
                 {
-                     Log($"no pending items to activate");
-                    _uncontested = true;
-                    return;
+                    Throw.InvalidLockHolder();
                 }
+
                 try
                 {
-                    // there's work to do; try and get a new token
-                    Log($"pending items: {_queue.Count}");
-                    int token = TryTakeLoopIfChanges();
-                    if (token == 0)
+                    if (_queue.Count == 0)
                     {
-                        // despite it being contested, somebody else
-                        // won the lock while we were busy thinking;
-                        // this is staggeringly rare, and means the
-                        // mutex isn't *absolteuly* fair, but it is
-                        // "fair enough" to be useful and practical
+                        Log($"no pending items to activate");
                         return;
                     }
 
+                    // there's work to do; get a new token
+                    Log($"pending items: {_queue.Count}");
+
+                    // we're expecting to activate; get a new token speculatively
+                    // (needs to be new so the old caller can't double-dispose and
+                    // release someone else's lock)
+                    Volatile.Write(ref _token, token = LockState.GetNextToken(token));
+
+                    // try to give the new token to someone
                     while (_queue.Count != 0)
                     {
                         var next = DequeueInsideLock();
                         if (next.TrySetResult(token))
                         {
                             Log($"handed lock to {next}");
-                            return; // so we don't release the token
+                            token = 0; // so we don't release the token
+                            return;
                         }
                         else
                         {
                             Log($"lock rejected by {next}");
                         }
                     }
-
-                    // nobody actually wanted it; return it
-                    Log("returning unwanted lock");
-                    Volatile.Write(ref _token, LockState.ChangeState(token, LockState.Pending));
                 }
                 finally
                 {
-                    _uncontested = _queue.Count == 0;
+                    if (token != 0) // nobody actually wanted it; return it
+                    { // (this could be the original token, or a new speculative token)
+                        Log("returning unwanted lock");
+                        Volatile.Write(ref _token, LockState.ChangeState(token, LockState.Pending));
+                    }
                     SetNextAsyncTimeoutInsideLock();
                 }
             }
@@ -206,7 +231,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
                 }
                 finally
                 {
-                    _uncontested = _queue.Count == 0;
                     SetNextAsyncTimeoutInsideLock();
                 }
             }
@@ -254,19 +278,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
                 }, this);
                 _timeoutCancel = cts;
             }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int TryTakeLoopIfChanges()
-        {
-            int current, next;
-            do // try and take, interlocked; if the value changes, we need to redo in case
-            { // it turns out to be different but still available
-                next = 0; // this is used if it turns out that the current state isn't pending
-                current = Volatile.Read(ref _token);
-            } while (LockState.GetState(current) == LockState.Pending // needs to look available
-                && Interlocked.CompareExchange(ref _token, next = LockState.GetNextToken(current), current) != current); // loop if changed
-            return next;
         }
 
         /// <summary>
@@ -319,9 +330,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
             SyncPendingLockToken item = null;
             try
             {
-                // mark as contested to force any other competitors away from the fast path
-                _uncontested = false;
-
                 var start = GetTime(); // read this promptly to include any time spent getting locks as part of our timeout interval
                 if (HasFlag(options, WaitOptions.NoDelay))
                 {
@@ -333,9 +341,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
                     Monitor.TryEnter(_queue, UpdateTimeOut(start, TimeoutMilliseconds), ref queueLockTaken);
                     if (!queueLockTaken) return LockToken.Fail(TimeoutReason.UnableToGetQueueLock);
                 }
-
-                // re-iterate just in case something changed while we were getting the lock
-                _uncontested = false;
 
                 int token;
                 if (_queue.Count == 0) // we now have the queue lock; are we fighting anyone? if not, we don't need to enqueue etc
@@ -432,7 +437,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
                 if (itemLockTaken) Monitor.Exit(item);
                 if (queueLockTaken)
                 {
-                    _uncontested = _queue.Count == 0; // if we still have the lock, fix this on the way out
                     Monitor.Exit(_queue);
                 }
             }
@@ -447,9 +451,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
             bool queueLockTaken = false;
             try
             {
-                // mark as contested to force any other competitors away from the fast path
-                _uncontested = false;
-
                 var start = GetTime(); // read this promptly to include any time spent getting locks as part of our timeout interval
                 if (HasFlag(options, WaitOptions.NoDelay))
                 {
@@ -464,9 +465,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
 
                 // check if it became cancelled while we were busy
                 if (cancellationToken.IsCancellationRequested) return GetCanceled();
-
-                // re-iterate just in case something changed while we were getting the lock
-                _uncontested = false;
 
                 int token;
                 if (_queue.Count == 0) // we now have the queue lock; are we fighting anyone? if not, we don't need to enqueue etc
@@ -535,7 +533,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
             {
                 if (queueLockTaken)
                 {
-                    _uncontested = _queue.Count == 0; // if we still have the lock, fix this on the way out
                     Monitor.Exit(_queue);
                 }
             }
@@ -577,10 +574,6 @@ namespace Pipelines.Sockets.Unofficial.Threading
         public ValueTask<LockToken> TryWaitAsync(CancellationToken cancellationToken = default, WaitOptions options = WaitOptions.None)
 #pragma warning restore RCS1231 // Make parameter ref read-only.
         {
-            int token;
-            if (_uncontested && !cancellationToken.IsCancellationRequested && (token = TryTakeOnceOnly()) != 0)
-                return new ValueTask<LockToken>(new LockToken(this, token));
-
             return TakeWithTimeoutAsync(cancellationToken, options);
         }
 
@@ -599,15 +592,7 @@ namespace Pipelines.Sockets.Unofficial.Threading
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public LockToken TryWait(WaitOptions options = WaitOptions.None)
-        {
-            int token;
-            if (_uncontested && (token = TryTakeOnceOnly()) != 0)
-                return new LockToken(this, token);
-
-            return TakeWithTimeout(options);
-        }
-
-        volatile bool _uncontested = true;
+            => TakeWithTimeout(options);
 
         /// <summary>
         /// Additional options that influence how TryWait/TryWaitAsync operate
